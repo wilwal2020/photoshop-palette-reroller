@@ -1,0 +1,601 @@
+"use strict";
+
+const VERSION = "1.6.1";
+
+const photoshop = require("photoshop");
+const app = photoshop.app;
+const { batchPlay } = photoshop.action;
+const { executeAsModal } = photoshop.core;
+
+/* ---------------- config ---------------- */
+const HARMONIES = ["Random", "Analogous", "Complementary", "Split", "Triadic", "Tetradic", "Mono"];
+const STYLES = ["Default", "Vibrant", "Muted", "Pastel", "Deep"];
+
+function styleParams(style) {
+  switch (style) {
+    case "Vibrant": return { satBase: 0.80, satJit: 0.10, briMin: 0.50, briMax: 0.92 };
+    case "Muted":   return { satBase: 0.32, satJit: 0.10, briMin: 0.45, briMax: 0.82 };
+    case "Pastel":  return { satBase: 0.28, satJit: 0.10, briMin: 0.80, briMax: 0.96 };
+    case "Deep":    return { satBase: 0.70, satJit: 0.12, briMin: 0.26, briMax: 0.60 };
+    default:        return { satBase: 0.58, satJit: 0.18, briMin: 0.38, briMax: 0.93 };
+  }
+}
+
+/* ---------------- state ---------------- */
+const state = {
+  harmony: "Random",
+  enabledHarmonies: ["Analogous", "Complementary", "Split", "Triadic", "Tetradic", "Mono"],
+  style: "Default",
+  swatches: [],     // [{ r, g, b, hex, locked, group }] aligned 1:1 with layerIDs
+  layerIDs: [],     // the working set of fill-layer IDs the panel controls
+  linkArm: null,    // index of the swatch currently armed for linking, or null
+  nextGroup: 0      // counter for minting fresh (solo) group ids
+};
+
+/* ---------------- color math ---------------- */
+function rand(a, b) { return a + Math.random() * (b - a); }
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function hsbToRgb(h, s, v) {
+  h = ((h % 360) + 360) % 360 / 360;
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  let r, g, b;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    case 5: r = v; g = p; b = q; break;
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+function rgbToHsb(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return { h: h, s: max === 0 ? 0 : d / max, v: max };
+}
+
+function toHex(r, g, b) {
+  const h = n => ("0" + n.toString(16)).slice(-2).toUpperCase();
+  return "#" + h(r) + h(g) + h(b);
+}
+
+function pickHarmony() {
+  const pool = state.enabledHarmonies.length ? state.enabledHarmonies : HARMONIES.slice(1);
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function buildHues(n, base, mode) {
+  const hues = []; let set, i;
+  if (mode === "Analogous") {
+    // spread to fill a pleasant arc rather than a fixed per-step gap
+    const span = rand(50, 95);                 // total degrees the set spans
+    const step = n > 1 ? span / (n - 1) : 0;
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    for (i = 0; i < n; i++) hues.push(base + dir * (i * step - span / 2) + rand(-5, 5));
+  } else if (mode === "Complementary") {
+    for (i = 0; i < n; i++) hues.push(base + (i % 2) * 180 + rand(-10, 10));
+  } else if (mode === "Split") {
+    set = [base, base + 150, base + 210];
+    for (i = 0; i < n; i++) hues.push(set[i % 3] + rand(-9, 9));
+  } else if (mode === "Triadic") {
+    set = [base, base + 120, base + 240];
+    for (i = 0; i < n; i++) hues.push(set[i % 3] + rand(-9, 9));
+  } else if (mode === "Tetradic") {
+    set = [base, base + 90, base + 180, base + 270];
+    for (i = 0; i < n; i++) hues.push(set[i % 4] + rand(-7, 7));
+  } else { // Mono — keep one hue but allow a faint drift so it isn't flat
+    for (i = 0; i < n; i++) hues.push(base + rand(-10, 10));
+  }
+  return hues;
+}
+
+// Collapse swatches into link-groups, in order of first appearance.
+// A group is locked if any of its members is locked; its current colour is
+// taken from the first member.
+function computeGroups() {
+  const order = [];
+  const map = {};
+  for (let i = 0; i < state.swatches.length; i++) {
+    const g = state.swatches[i].group;
+    if (!(g in map)) { map[g] = { key: g, members: [], locked: false }; order.push(map[g]); }
+    map[g].members.push(i);
+    if (state.swatches[i].locked) map[g].locked = true;
+  }
+  order.forEach(grp => {
+    const s = state.swatches[grp.members[0]];
+    grp.color = { r: s.r, g: s.g, b: s.b, hex: s.hex };
+  });
+  return order;
+}
+
+// Generate one colour per distinct group and write it to every member layer.
+// Locked groups keep their colour and still "use up" a hue/tone slot so the
+// rest harmonize around them. Brightness/saturation tones are distributed as a
+// balanced set and then shuffled, so no layer is permanently the brightest.
+function generateGroupedPalette() {
+  const groups = computeGroups();
+  const n = groups.length;
+  const mode = pickHarmony();
+  const sp = styleParams(state.style);
+
+  // base hue: anchor to a locked group's hue if present, else random
+  let baseHue = Math.random() * 360;
+  for (const grp of groups) {
+    if (grp.locked) { baseHue = rgbToHsb(grp.color.r, grp.color.g, grp.color.b).h; break; }
+  }
+  const hues = buildHues(n, baseHue, mode);
+
+  // Build a balanced tone for each slot: brightness spread evenly across the
+  // style's range (so swatches stay visually separated), with light jitter.
+  const tones = [];
+  for (let i = 0; i < n; i++) {
+    const t = n > 1 ? i / (n - 1) : 0.5;
+    let bri = sp.briMin + t * (sp.briMax - sp.briMin);
+    bri = clamp(bri + rand(-0.045, 0.045), 0.08, 0.98);
+    let sat = clamp(sp.satBase + rand(-sp.satJit, sp.satJit), 0.05, 0.98);
+    if (bri > 0.86) sat *= 0.7;        // keep very light tones from going neon
+    if (bri < 0.22) sat = Math.min(sat, 0.85); // keep very dark tones from clipping
+    tones.push({ bri: bri, sat: sat });
+  }
+  shuffle(tones);                       // break the fixed position->brightness link
+
+  // Assign hues to groups, then pull a shuffled tone for each unlocked group.
+  // Locked groups consume a hue slot but keep their own colour and tone.
+  let toneCursor = 0;
+  for (let gi = 0; gi < n; gi++) {
+    const grp = groups[gi];
+    let color;
+    if (grp.locked) {
+      color = grp.color;
+      toneCursor++;                     // locked group still claims a tone slot
+    } else {
+      const tone = tones[toneCursor++];
+      const rgb = hsbToRgb(hues[gi], tone.sat, tone.bri);
+      color = { r: rgb[0], g: rgb[1], b: rgb[2], hex: toHex(rgb[0], rgb[1], rgb[2]) };
+    }
+    for (const idx of grp.members) {
+      const s = state.swatches[idx];
+      s.r = color.r; s.g = color.g; s.b = color.b; s.hex = color.hex;
+    }
+  }
+}
+
+/* ---------------- Photoshop I/O ---------------- */
+
+// Returns the IDs of selected layers whose content is a solid color fill.
+async function getSolidFillLayerIDs() {
+  if (!app.documents.length) return [];
+  const layers = app.activeDocument.activeLayers;
+  if (!layers.length) return [];
+  const gets = layers.map(l => ({ _obj: "get", _target: [{ _ref: "layer", _id: l.id }] }));
+  const descs = await batchPlay(gets, {});
+  const ids = [];
+  for (let i = 0; i < layers.length; i++) {
+    const adj = descs[i] && descs[i].adjustment;
+    if (adj && adj.length && adj[0]._obj === "solidColorLayer") ids.push(layers[i].id);
+  }
+  return ids;
+}
+
+// Recolor all target fill layers in one batched, single-undo operation.
+async function applyColors(ids, palette) {
+  const cmds = [];
+  for (let i = 0; i < ids.length; i++) {
+    cmds.push({ _obj: "select", _target: [{ _ref: "layer", _id: ids[i] }], makeVisible: false });
+    const c = palette[i];
+    cmds.push({
+      _obj: "set",
+      _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
+      to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: c.r, grain: c.g, blue: c.b } }
+    });
+  }
+  // restore the original multi-selection so the next roll has the same set
+  for (let i = 0; i < ids.length; i++) {
+    const cmd = { _obj: "select", _target: [{ _ref: "layer", _id: ids[i] }], makeVisible: false };
+    if (i > 0) cmd.selectionModifier = { _enum: "selectionModifierType", _value: "addToSelection" };
+    cmds.push(cmd);
+  }
+
+  suppress = true;
+  try {
+    await executeAsModal(async (ctx) => {
+      let suspId;
+      try { suspId = await ctx.hostControl.suspendHistory({ documentID: app.activeDocument.id, name: "Re-roll Palette" }); } catch (e) {}
+      await batchPlay(cmds, {});
+      if (suspId !== undefined) { try { await ctx.hostControl.resumeHistory(suspId); } catch (e) {} }
+    }, { commandName: "Re-roll Palette" });
+  } finally {
+    // release a tick later so trailing change events from our own op are ignored
+    setTimeout(() => { suppress = false; }, 60);
+  }
+}
+
+/* ---------------- main action ---------------- */
+let busy = false;
+let suppress = false;   // true while we're applying our own changes
+let syncTimer = null;
+
+// Read the live colours of the working layer set and update the swatches.
+// Used by the change/undo listener so the panel mirrors the document.
+async function syncFromLayers() {
+  if (!state.layerIDs.length || !app.documents.length) return;
+  let descs;
+  try {
+    const gets = state.layerIDs.map(id => ({ _obj: "get", _target: [{ _ref: "layer", _id: id }] }));
+    descs = await batchPlay(gets, {});
+  } catch (e) { return; }
+  let changed = false;
+  for (let i = 0; i < state.layerIDs.length && i < state.swatches.length; i++) {
+    const adj = descs[i] && descs[i].adjustment;
+    if (adj && adj.length && adj[0]._obj === "solidColorLayer" && adj[0].color) {
+      const col = adj[0].color;
+      const r = Math.round(col.red), g = Math.round(col.grain), b = Math.round(col.blue);
+      const s = state.swatches[i];
+      if (s.r !== r || s.g !== g || s.b !== b) {
+        s.r = r; s.g = g; s.b = b; s.hex = toHex(r, g, b);
+        changed = true;
+      }
+    }
+  }
+  if (changed) renderSwatches();
+}
+
+function onPsEvent() {
+  if (suppress) return;
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    syncTimer = null;
+    if (suppress || busy) return;
+    await syncFromLayers();
+  }, 130);
+}
+
+// Define (or replace) the working set and rebuild aligned swatch slots.
+function captureSet(ids) {
+  state.layerIDs = ids.slice();
+  state.swatches = [];
+  state.linkArm = null;
+  state.nextGroup = 0;
+  for (let i = 0; i < ids.length; i++) {
+    state.swatches.push({ r: 0, g: 0, b: 0, hex: "#000000", locked: false, group: state.nextGroup++ });
+  }
+}
+
+function sameSet(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  const sa = a.slice().sort((x, y) => x - y), sb = b.slice().sort((x, y) => x - y);
+  return sa.every((v, i) => v === sb[i]);
+}
+
+async function reroll() {
+  if (busy) return;
+  busy = true;
+  try {
+    const sel = await getSolidFillLayerIDs();
+    const have = state.layerIDs.length > 0;
+    // A new multi-layer selection redefines the set; otherwise keep the stored set.
+    if (sel.length >= 2 && !(have && sameSet(sel, state.layerIDs))) {
+      captureSet(sel);
+    } else if (!have) {
+      if (!sel.length) { setStatus("Select one or more Solid Color fill layers."); return; }
+      captureSet(sel);
+    }
+    generateGroupedPalette();
+    await applyColors(state.layerIDs, state.swatches);
+    renderSwatches();
+    const n = state.layerIDs.length;
+    setStatus(n + " layer" + (n > 1 ? "s" : "") + " recolored.");
+  } catch (e) {
+    setStatus("Error: " + (e && e.message ? e.message : e));
+  } finally {
+    busy = false;
+  }
+}
+
+/* ---------------- UI ---------------- */
+function setStatus(msg) { document.getElementById("status").textContent = msg; }
+
+// Reassign colours to different layers by rotating them among the unlocked
+// groups. Linked layers move together; locked groups stay put.
+async function swapPositions() {
+  if (busy) return;
+  if (!state.swatches.length || !state.layerIDs.length) { setStatus("Generate a palette first."); return; }
+  const groups = computeGroups();
+  const unlocked = groups.filter(grp => !grp.locked);
+  if (unlocked.length < 2) { setStatus("Need 2+ unlocked groups to swap."); return; }
+
+  busy = true;
+  try {
+    const colors = unlocked.map(grp => ({ r: grp.color.r, g: grp.color.g, b: grp.color.b, hex: grp.color.hex }));
+    const rotated = colors.slice(1).concat(colors[0]); // shift by one
+    unlocked.forEach((grp, k) => {
+      const c = rotated[k];
+      for (const idx of grp.members) {
+        const s = state.swatches[idx];
+        s.r = c.r; s.g = c.g; s.b = c.b; s.hex = c.hex;
+      }
+    });
+
+    await applyColors(state.layerIDs, state.swatches);
+    renderSwatches();
+    setStatus("Swapped positions.");
+  } catch (e) {
+    setStatus("Error: " + (e && e.message ? e.message : e));
+  } finally {
+    busy = false;
+  }
+}
+
+/* ---------------- linking ---------------- */
+function groupSize(g) { let c = 0; for (const s of state.swatches) if (s.group === g) c++; return c; }
+function isLinked(idx) { return groupSize(state.swatches[idx].group) > 1; }
+
+// recolor every layer from current swatch state, then re-render
+async function applyAll(msg) {
+  busy = true;
+  try {
+    if (state.layerIDs.length === state.swatches.length) await applyColors(state.layerIDs, state.swatches);
+  } catch (e) {
+    setStatus("Error: " + (e && e.message ? e.message : e));
+  } finally {
+    busy = false;
+  }
+  renderSwatches();
+  if (msg) setStatus(msg);
+}
+
+// Merge the armed swatch into the target's group and adopt its colour.
+async function completeLink(a, b) {
+  state.linkArm = null;
+  state.swatches[a].group = state.swatches[b].group;
+  const sib = state.swatches[b], s = state.swatches[a];
+  s.r = sib.r; s.g = sib.g; s.b = sib.b; s.hex = sib.hex;
+  await applyAll("Linked.");
+}
+
+// Pop a swatch out of its group into a fresh solo group (colour unchanged).
+function unlinkSwatch(idx) {
+  state.swatches[idx].group = state.nextGroup++;
+  renderSwatches();
+  setStatus("Unlinked.");
+}
+
+// Handle a tap on a swatch's link icon.
+function onLinkClick(idx) {
+  if (busy) return;
+  if (state.linkArm !== null) {
+    if (idx === state.linkArm) { state.linkArm = null; renderSwatches(); setStatus(""); }
+    else { completeLink(state.linkArm, idx); }
+    return;
+  }
+  if (isLinked(idx)) { unlinkSwatch(idx); }
+  else { state.linkArm = idx; renderSwatches(); setStatus("Now tap another colour to link."); }
+}
+
+// Handle a tap on a swatch row body.
+function onRowClick(idx) {
+  if (busy) return;
+  if (state.linkArm !== null) {            // linking mode: complete or cancel
+    if (idx === state.linkArm) { state.linkArm = null; renderSwatches(); setStatus(""); }
+    else { completeLink(state.linkArm, idx); }
+    return;
+  }
+  state.swatches[idx].locked = !state.swatches[idx].locked;  // normal: toggle lock
+  renderSwatches();
+}
+
+function renderSwatches() {
+  const host = document.getElementById("swatches");
+  host.innerHTML = "";
+  if (!state.swatches.length) {
+    const ph = document.createElement("div");
+    ph.className = "placeholder";
+    ph.textContent = "Select your Solid Color fill layers, then hit Generate.";
+    host.appendChild(ph);
+    return;
+  }
+
+  state.swatches.forEach((s, idx) => {
+    const armed = state.linkArm === idx;
+    const linking = state.linkArm !== null;
+    const linked = isLinked(idx);
+
+    const row = document.createElement("div");
+    row.className = "sw" + (s.locked ? " locked" : "") + (armed ? " armed" : "")
+                  + (linking && !armed ? " target" : "");
+
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    chip.style.background = s.hex;
+    const lock = document.createElement("div");
+    lock.className = "lock";
+    chip.appendChild(lock);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const hex = document.createElement("div");
+    hex.className = "hex";
+    hex.textContent = s.hex;
+    const st = document.createElement("div");
+    st.className = "state";
+    st.textContent = armed ? "linking\u2026" : (s.locked ? "locked" : (linked ? "linked" : "unlocked"));
+    meta.appendChild(hex);
+    meta.appendChild(st);
+
+    const link = document.createElement("div");
+    link.className = "link" + (linked ? " on" : "") + (armed ? " armed" : "");
+    link.title = "Link / unlink this colour with another";
+    const chain = document.createElement("span");
+    chain.className = "chain";
+    link.appendChild(chain);
+    link.addEventListener("click", (e) => { e.stopPropagation(); onLinkClick(idx); });
+
+    row.appendChild(chip);
+    row.appendChild(meta);
+    row.appendChild(link);
+    row.addEventListener("click", () => onRowClick(idx));
+    host.appendChild(row);
+  });
+}
+
+// Minimal custom dropdown (native <select> is unreliable in UXP).
+function buildDropdown(mountId, options, getVal, setVal) {
+  const mount = document.getElementById(mountId);
+  const dd = document.createElement("div");
+  dd.className = "dd";
+
+  const head = document.createElement("div");
+  head.className = "dd-head";
+  const headText = document.createElement("span");
+  headText.textContent = getVal();
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "\u25BE";
+  head.appendChild(headText);
+  head.appendChild(caret);
+
+  const list = document.createElement("div");
+  list.className = "dd-list";
+  options.forEach(opt => {
+    const item = document.createElement("div");
+    item.className = "dd-item" + (opt === getVal() ? " sel" : "");
+    item.textContent = opt;
+    item.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setVal(opt);
+      headText.textContent = opt;
+      list.querySelectorAll(".dd-item").forEach(el =>
+        el.classList.toggle("sel", el.textContent === opt));
+      dd.classList.remove("open");
+    });
+    list.appendChild(item);
+  });
+
+  head.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeAllDropdowns(dd);
+    dd.classList.toggle("open");
+  });
+
+  dd.appendChild(head);
+  dd.appendChild(list);
+  mount.appendChild(dd);
+}
+
+function closeAllDropdowns(except) {
+  document.querySelectorAll(".dd.open").forEach(d => { if (d !== except) d.classList.remove("open"); });
+}
+
+// Multi-select checklist dropdown. `selected` is the live array to mutate.
+function buildChecklist(mountId, options, selected) {
+  const mount = document.getElementById(mountId);
+  const dd = document.createElement("div");
+  dd.className = "dd";
+
+  const head = document.createElement("div");
+  head.className = "dd-head";
+  const headText = document.createElement("span");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "\u25BE";
+  head.appendChild(headText);
+  head.appendChild(caret);
+
+  function summary() {
+    if (selected.length === 0) return "None";
+    if (selected.length === options.length) return "All";
+    if (selected.length <= 2) return selected.join(", ");
+    return selected.length + " selected";
+  }
+  function refreshHead() { headText.textContent = summary(); }
+  refreshHead();
+
+  const list = document.createElement("div");
+  list.className = "dd-list";
+  options.forEach(opt => {
+    const item = document.createElement("div");
+    item.className = "dd-item check";
+    const box = document.createElement("span");
+    box.className = "box";
+    const txt = document.createElement("span");
+    txt.textContent = opt;
+    item.appendChild(box);
+    item.appendChild(txt);
+    function refreshItem() { item.classList.toggle("on", selected.indexOf(opt) >= 0); }
+    refreshItem();
+    item.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const at = selected.indexOf(opt);
+      if (at >= 0) { if (selected.length > 1) selected.splice(at, 1); }  // keep >=1
+      else selected.push(opt);
+      refreshItem();
+      refreshHead();
+    });
+    list.appendChild(item);
+  });
+
+  head.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeAllDropdowns(dd);
+    dd.classList.toggle("open");
+  });
+
+  dd.appendChild(head);
+  dd.appendChild(list);
+  mount.appendChild(dd);
+}
+
+/* ---------------- init ---------------- */
+function init() {
+  const vEl = document.getElementById("version");
+  if (vEl) vEl.textContent = "v" + VERSION;
+
+  const HARMONY_OPTS = HARMONIES.slice(1); // drop the old "Random" entry
+  buildChecklist("harmonyDD", HARMONY_OPTS, state.enabledHarmonies);
+  buildDropdown("styleDD", STYLES, () => state.style, v => { state.style = v; });
+
+  const genBtn = document.getElementById("generate");
+  const swapBtn = document.getElementById("swap");
+  genBtn.addEventListener("click", () => { reroll(); genBtn.blur(); });
+  swapBtn.addEventListener("click", () => { swapPositions(); swapBtn.blur(); });
+  // make the buttons mouse-only so a focused button can't be re-fired by Space/Enter
+  [genBtn, swapBtn].forEach(el => {
+    const swallow = (e) => {
+      if (e.key === " " || e.key === "Spacebar" || e.code === "Space" || e.key === "Enter") {
+        e.preventDefault(); e.stopPropagation();
+      }
+    };
+    el.addEventListener("keydown", swallow);
+    el.addEventListener("keyup", swallow);
+  });
+
+  document.addEventListener("click", () => closeAllDropdowns(null));
+
+  // live-sync: re-read colours when the document changes or is undone/redone
+  try {
+    photoshop.action.addNotificationListener(["set", "historyStateChanged"], (event) => onPsEvent(event));
+  } catch (e) { /* live sync unavailable on this build; rest of panel still works */ }
+
+  renderSwatches();
+}
+
+init();
