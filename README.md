@@ -41,4 +41,4 @@ so Photoshop reliably recognizes the update, keeps this README in sync, and
 regenerates `PaletteReroller.ccx`. Then commit and push — opening the updated
 `.ccx` installs the new version.
 
-Current version: **1.6.3** (set in `src/manifest.json`)
+Current version: **1.6.4** (set in `src/manifest.json`)

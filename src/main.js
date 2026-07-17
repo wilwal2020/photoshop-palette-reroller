@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "1.6.3";
+const VERSION = "1.6.4";
 
 const photoshop = require("photoshop");
 const app = photoshop.app;
@@ -399,6 +399,7 @@ function sameSet(a, b) {
 
 async function reroll() {
   if (busy) return;
+  hoverRevealOut();   // release any held reveal so our modal isn't queued behind it
   busy = true;
   try {
     pruneMissingLayers();
@@ -430,6 +431,7 @@ function setStatus(msg) { document.getElementById("status").textContent = msg; }
 // groups. Linked layers move together; locked groups stay put.
 async function swapPositions() {
   if (busy) return;
+  hoverRevealOut();
   pruneMissingLayers();
   if (!state.swatches.length || !state.layerIDs.length) { setStatus("Generate a palette first."); return; }
   const groups = computeGroups();
@@ -455,6 +457,75 @@ async function swapPositions() {
     setStatus("Error: " + (e && e.message ? e.message : e));
   } finally {
     busy = false;
+  }
+}
+
+/* ---------------- hover reveal ---------------- */
+// Hovering a swatch's chain icon flashes its layer chroma-green in the
+// document, so you can instantly see which layer the row controls. The green
+// is applied inside a modal scope that stays open while the pointer hovers;
+// on release the suspended history is rolled back (resumeHistory(id, false)),
+// so the flash never touches the undo stack. Capped at HL_MAX_MS so Photoshop
+// never brings up its slow-operation progress dialog.
+const HL_MAX_MS = 1500;
+let hlActive = false;
+let hlRelease = null;   // resolves the promise holding the modal open
+let hlNext = null;      // row queued while a previous flash is still closing
+
+function endHighlight() {
+  if (hlRelease) { hlRelease(); hlRelease = null; }
+}
+function hoverRevealOut() { hlNext = null; endHighlight(); }
+
+async function hoverRevealIn(idx) {
+  if (busy) return;
+  if (hlActive) { hlNext = idx; return; }   // start it once the current one closes
+  if (!app.documents.length || idx >= state.layerIDs.length) return;
+  const id = state.layerIDs[idx];
+  const orig = state.swatches[idx];         // fallback restore colour
+  hlActive = true;
+  suppress = true;
+  const held = new Promise(res => { hlRelease = res; });
+  const timer = setTimeout(endHighlight, HL_MAX_MS);
+  try {
+    await executeAsModal(async (ctx) => {
+      const prevSel = app.activeDocument.activeLayers.map(l => l.id);
+      let susp;
+      try { susp = await ctx.hostControl.suspendHistory({ documentID: app.activeDocument.id, name: "Reveal Layer" }); } catch (e) {}
+      await batchPlay([
+        { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false },
+        { _obj: "set", _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
+          to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: 0, grain: 255, blue: 0 } } }
+      ], {});
+      await held;                           // keep the green up while hovering
+      let reverted = false;
+      if (susp !== undefined) {
+        try { await ctx.hostControl.resumeHistory(susp, false); reverted = true; } catch (e) {}
+      }
+      if (!reverted) {                      // belt-and-braces: restore by hand
+        await batchPlay([
+          { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false },
+          { _obj: "set", _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
+            to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: orig.r, grain: orig.g, blue: orig.b } } }
+        ], {});
+      }
+      // put the user's layer selection back the way it was
+      const sel = [];
+      for (let i = 0; i < prevSel.length; i++) {
+        const cmd = { _obj: "select", _target: [{ _ref: "layer", _id: prevSel[i] }], makeVisible: false };
+        if (i > 0) cmd.selectionModifier = { _enum: "selectionModifierType", _value: "addToSelection" };
+        sel.push(cmd);
+      }
+      if (sel.length) await batchPlay(sel, {});
+    }, { commandName: "Reveal Layer" });
+  } catch (e) {
+    /* layer gone or modal unavailable — nothing to restore */
+  } finally {
+    clearTimeout(timer);
+    hlActive = false;
+    hlRelease = null;
+    setTimeout(() => { suppress = false; }, 60);
+    if (hlNext !== null) { const nx = hlNext; hlNext = null; hoverRevealIn(nx); }
   }
 }
 
@@ -496,6 +567,7 @@ function unlinkSwatch(idx) {
 // Handle a tap on a swatch's link icon.
 function onLinkClick(idx) {
   if (busy) return;
+  hoverRevealOut();   // free the held reveal modal so the action runs immediately
   if (state.linkArm !== null) {
     if (idx === state.linkArm) { state.linkArm = null; renderSwatches(); setStatus(""); }
     else { completeLink(state.linkArm, idx); }
@@ -508,6 +580,7 @@ function onLinkClick(idx) {
 // Handle a tap on a swatch row body.
 function onRowClick(idx) {
   if (busy) return;
+  hoverRevealOut();
   if (state.linkArm !== null) {            // linking mode: complete or cancel
     if (idx === state.linkArm) { state.linkArm = null; renderSwatches(); setStatus(""); }
     else { completeLink(state.linkArm, idx); }
@@ -557,11 +630,13 @@ function renderSwatches() {
 
     const link = document.createElement("div");
     link.className = "link" + (linked ? " on" : "") + (armed ? " armed" : "");
-    link.title = "Link / unlink this colour with another";
+    link.title = "Hover: flash this layer green in the document. Click: link / unlink with another colour.";
     const chain = document.createElement("span");
     chain.className = "chain";
     link.appendChild(chain);
     link.addEventListener("click", (e) => { e.stopPropagation(); onLinkClick(idx); });
+    link.addEventListener("pointerenter", () => hoverRevealIn(idx));
+    link.addEventListener("pointerleave", () => hoverRevealOut());
 
     row.appendChild(chip);
     row.appendChild(meta);
