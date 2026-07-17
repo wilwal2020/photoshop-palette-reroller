@@ -12,3 +12,6 @@ desktop.ini
 
 # Node
 node_modules/
+
+# Redundant with the .ccx package
+PaletteReroller.zip
