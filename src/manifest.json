@@ -1,0 +1,40 @@
+{
+  "manifestVersion": 5,
+  "id": "com.william.palettereroller",
+  "name": "Palette Re-roller",
+  "version": "1.6.1",
+  "main": "index.html",
+  "host": {
+    "app": "PS",
+    "minVersion": "23.3.0"
+  },
+  "icons": [
+    {
+      "width": 48, "height": 48, "path": "icons/plugin.png",
+      "scale": [1, 2],
+      "theme": ["darkest", "dark", "medium", "lightest", "light"],
+      "species": ["pluginList"]
+    }
+  ],
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "paletteRerollerPanel",
+      "label": { "default": "Palette Re-roller" },
+      "minimumSize": { "width": 200, "height": 220 },
+      "maximumSize": { "width": 2000, "height": 2000 },
+      "preferredDockedSize": { "width": 240, "height": 380 },
+      "preferredFloatingSize": { "width": 260, "height": 420 },
+      "icons": [
+        {
+          "width": 23, "height": 23, "path": "icons/panel_dark.png",
+          "scale": [1, 2], "theme": ["darkest", "dark", "medium"]
+        },
+        {
+          "width": 23, "height": 23, "path": "icons/panel_light.png",
+          "scale": [1, 2], "theme": ["lightest", "light"]
+        }
+      ]
+    }
+  ]
+}
