@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "1.6.4";
+const VERSION = "1.6.5";
 
 const photoshop = require("photoshop");
 const app = photoshop.app;
@@ -461,72 +461,112 @@ async function swapPositions() {
 }
 
 /* ---------------- hover reveal ---------------- */
-// Hovering a swatch's chain icon flashes its layer chroma-green in the
-// document, so you can instantly see which layer the row controls. The green
-// is applied inside a modal scope that stays open while the pointer hovers;
-// on release the suspended history is rolled back (resumeHistory(id, false)),
-// so the flash never touches the undo stack. Capped at HL_MAX_MS so Photoshop
-// never brings up its slow-operation progress dialog.
-const HL_MAX_MS = 1500;
-let hlActive = false;
-let hlRelease = null;   // resolves the promise holding the modal open
-let hlNext = null;      // row queued while a previous flash is still closing
+// Hovering a swatch's chain icon paints its layer chroma-green in the
+// document so you can instantly see which layer the row controls; moving the
+// pointer away restores it. The green is committed as its own named history
+// state, and on release we *step back* through history — undo navigation adds
+// nothing to the stack, so the user's undo history is left exactly as it was.
+// (A held-open modal scope would avoid the history state entirely, but
+// Photoshop doesn't repaint the canvas while a modal is held, so the green
+// would never show.)
+const HL_NAME = "Reveal Layer";
+const HL_GREEN = { red: 0, grain: 255, blue: 0 };
+let hlShown = -1;                  // row index currently painted green, or -1
+let hlChain = Promise.resolve();   // serializes reveal/restore operations
 
-function endHighlight() {
-  if (hlRelease) { hlRelease(); hlRelease = null; }
+function queueHl(fn) { hlChain = hlChain.then(fn).catch(() => {}); }
+
+function selectLayersCmds(ids) {
+  return ids.map((id, i) => {
+    const cmd = { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false };
+    if (i > 0) cmd.selectionModifier = { _enum: "selectionModifierType", _value: "addToSelection" };
+    return cmd;
+  });
 }
-function hoverRevealOut() { hlNext = null; endHighlight(); }
 
-async function hoverRevealIn(idx) {
+function hoverRevealIn(idx) {
   if (busy) return;
-  if (hlActive) { hlNext = idx; return; }   // start it once the current one closes
-  if (!app.documents.length || idx >= state.layerIDs.length) return;
-  const id = state.layerIDs[idx];
-  const orig = state.swatches[idx];         // fallback restore colour
-  hlActive = true;
-  suppress = true;
-  const held = new Promise(res => { hlRelease = res; });
-  const timer = setTimeout(endHighlight, HL_MAX_MS);
-  try {
-    await executeAsModal(async (ctx) => {
-      const prevSel = app.activeDocument.activeLayers.map(l => l.id);
-      let susp;
-      try { susp = await ctx.hostControl.suspendHistory({ documentID: app.activeDocument.id, name: "Reveal Layer" }); } catch (e) {}
-      await batchPlay([
-        { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false },
-        { _obj: "set", _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
-          to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: 0, grain: 255, blue: 0 } } }
-      ], {});
-      await held;                           // keep the green up while hovering
-      let reverted = false;
-      if (susp !== undefined) {
-        try { await ctx.hostControl.resumeHistory(susp, false); reverted = true; } catch (e) {}
-      }
-      if (!reverted) {                      // belt-and-braces: restore by hand
+  queueHl(async () => {
+    if (busy || hlShown !== -1) return;
+    if (!app.documents.length || idx >= state.layerIDs.length) return;
+    const id = state.layerIDs[idx];
+    suppress = true;
+    try {
+      await executeAsModal(async (ctx) => {
+        const prevSel = app.activeDocument.activeLayers.map(l => l.id);
+        let susp;
+        try { susp = await ctx.hostControl.suspendHistory({ documentID: app.activeDocument.id, name: HL_NAME }); } catch (e) {}
         await batchPlay([
           { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false },
           { _obj: "set", _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
-            to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: orig.r, grain: orig.g, blue: orig.b } } }
+            to: { _obj: "solidColorLayer", color: Object.assign({ _obj: "RGBColor" }, HL_GREEN) } }
         ], {});
-      }
-      // put the user's layer selection back the way it was
-      const sel = [];
-      for (let i = 0; i < prevSel.length; i++) {
-        const cmd = { _obj: "select", _target: [{ _ref: "layer", _id: prevSel[i] }], makeVisible: false };
-        if (i > 0) cmd.selectionModifier = { _enum: "selectionModifierType", _value: "addToSelection" };
-        sel.push(cmd);
-      }
-      if (sel.length) await batchPlay(sel, {});
-    }, { commandName: "Reveal Layer" });
-  } catch (e) {
-    /* layer gone or modal unavailable — nothing to restore */
-  } finally {
-    clearTimeout(timer);
-    hlActive = false;
-    hlRelease = null;
-    setTimeout(() => { suppress = false; }, 60);
-    if (hlNext !== null) { const nx = hlNext; hlNext = null; hoverRevealIn(nx); }
-  }
+        const sel = selectLayersCmds(prevSel);      // selection back right away
+        if (sel.length) await batchPlay(sel, {});
+        if (susp !== undefined) { try { await ctx.hostControl.resumeHistory(susp); } catch (e) {} }
+      }, { commandName: HL_NAME });
+      hlShown = idx;
+    } catch (e) {
+      /* layer gone or modal unavailable — nothing shown */
+    } finally {
+      setTimeout(() => { suppress = false; }, 60);
+    }
+  });
+}
+
+function hoverRevealOut() {
+  queueHl(async () => {
+    if (hlShown === -1) return;
+    const idx = hlShown;
+    hlShown = -1;
+    if (!app.documents.length || idx >= state.layerIDs.length) return;
+    const id = state.layerIDs[idx];
+    const orig = state.swatches[idx];
+    suppress = true;
+    try {
+      await executeAsModal(async () => {
+        // Normal case: the top history state is still our reveal — stepping
+        // back removes the green and leaves the undo stack untouched.
+        let name = "";
+        try {
+          const d = await batchPlay([{ _obj: "get", _target: [{ _ref: "historyState", _enum: "ordinal", _value: "targetEnum" }] }], {});
+          if (d && d[0] && typeof d[0].name === "string") name = d[0].name;
+        } catch (e) {}
+        if (name === HL_NAME) {
+          await batchPlay([{ _obj: "select", _target: [{ _ref: "historyState", _enum: "ordinal", _value: "previous" }] }], {});
+          return;
+        }
+        // Something else happened in between — repaint the original colour,
+        // but only if the layer is actually still green.
+        let isGreen = false;
+        try {
+          const d2 = await batchPlay([{ _obj: "get", _target: [{ _ref: "layer", _id: id }] }], {});
+          const adj = d2 && d2[0] && d2[0].adjustment;
+          if (adj && adj.length && adj[0]._obj === "solidColorLayer" && adj[0].color
+              && typeof adj[0].color.red === "number") {
+            const c = adj[0].color;
+            isGreen = Math.round(c.red) === HL_GREEN.red
+                   && Math.round(c.grain) === HL_GREEN.grain
+                   && Math.round(c.blue) === HL_GREEN.blue;
+          }
+        } catch (e) {}
+        if (isGreen) {
+          const prevSel = app.activeDocument.activeLayers.map(l => l.id);
+          await batchPlay([
+            { _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false },
+            { _obj: "set", _target: [{ _ref: "contentLayer", _enum: "ordinal", _value: "targetEnum" }],
+              to: { _obj: "solidColorLayer", color: { _obj: "RGBColor", red: orig.r, grain: orig.g, blue: orig.b } } }
+          ], {});
+          const sel = selectLayersCmds(prevSel);
+          if (sel.length) await batchPlay(sel, {});
+        }
+      }, { commandName: "Restore Layer" });
+    } catch (e) {
+      /* nothing to restore */
+    } finally {
+      setTimeout(() => { suppress = false; }, 60);
+    }
+  });
 }
 
 /* ---------------- linking ---------------- */
