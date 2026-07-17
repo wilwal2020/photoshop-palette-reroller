@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "src")
 OUT = os.path.join(HERE, "PaletteReroller.ccx")
 MANIFEST = os.path.join(SRC, "manifest.json")
+MAIN_JS = os.path.join(SRC, "main.js")
 README = os.path.join(HERE, "README.md")
 
 
@@ -41,8 +42,19 @@ def bump_version(part):
     with open(MANIFEST, "w", encoding="utf-8") as f:
         f.write(text)
     sync_readme(new_version)
+    sync_main_js(new_version)
     print(f"Bumped version {old_version} -> {new_version}")
     return new_version
+
+
+def sync_main_js(version):
+    """Keep the VERSION constant shown in the panel in step with the manifest."""
+    with open(MAIN_JS, "r", encoding="utf-8") as f:
+        text = f.read()
+    new_text = re.sub(r'(const VERSION = ")[^"]+(")', rf"\g<1>{version}\g<2>", text, count=1)
+    if new_text != text:
+        with open(MAIN_JS, "w", encoding="utf-8") as f:
+            f.write(new_text)
 
 
 def sync_readme(version):

@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "1.6.1";
+const VERSION = "1.6.3";
 
 const photoshop = require("photoshop");
 const app = photoshop.app;
@@ -23,7 +23,6 @@ function styleParams(style) {
 
 /* ---------------- state ---------------- */
 const state = {
-  harmony: "Random",
   enabledHarmonies: ["Analogous", "Complementary", "Split", "Triadic", "Tetradic", "Mono"],
   style: "Default",
   swatches: [],     // [{ r, g, b, hex, locked, group }] aligned 1:1 with layerIDs
@@ -78,6 +77,19 @@ function toHex(r, g, b) {
   return "#" + h(r) + h(g) + h(b);
 }
 
+// shortest angular distance between two hues, 0..180
+function circDist(a, b) {
+  const d = Math.abs((((a - b) % 360) + 360) % 360);
+  return d > 180 ? 360 - d : d;
+}
+
+// "redmean" weighted RGB distance — cheap but tracks perception reasonably well
+function colorDist(a, b) {
+  const rm = (a.r + b.r) / 2;
+  const dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+  return Math.sqrt((2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db);
+}
+
 function pickHarmony() {
   const pool = state.enabledHarmonies.length ? state.enabledHarmonies : HARMONIES.slice(1);
   return pool[Math.floor(Math.random() * pool.length)];
@@ -127,25 +139,57 @@ function computeGroups() {
   return order;
 }
 
-// Generate one colour per distinct group and write it to every member layer.
-// Locked groups keep their colour and still "use up" a hue/tone slot so the
-// rest harmonize around them. Brightness/saturation tones are distributed as a
-// balanced set and then shuffled, so no layer is permanently the brightest.
-function generateGroupedPalette() {
-  const groups = computeGroups();
+// Build one candidate palette: an array of {r,g,b,hex}, one per group.
+// Locked groups keep their colour and anchor the base hue. Each locked group
+// claims the hue slot *nearest its own hue*, so the remaining slots (the
+// complement, the triad arms, …) go to the unlocked groups — locking a swatch
+// never causes another swatch to duplicate its hue.
+function buildCandidate(groups, mode, sp) {
   const n = groups.length;
-  const mode = pickHarmony();
-  const sp = styleParams(state.style);
+  // Mono can't separate swatches by hue, so give it a wider tonal range and
+  // more saturation variety — monochrome palettes live on value contrast.
+  if (mode === "Mono") {
+    sp = {
+      satBase: sp.satBase,
+      satJit: Math.max(sp.satJit, 0.24),
+      briMin: Math.max(0.10, sp.briMin - 0.14),
+      briMax: Math.min(0.97, sp.briMax + 0.04)
+    };
+  }
+  const lockedIdx = [];
+  for (let i = 0; i < n; i++) if (groups[i].locked) lockedIdx.push(i);
 
-  // base hue: anchor to a locked group's hue if present, else random
   let baseHue = Math.random() * 360;
-  for (const grp of groups) {
-    if (grp.locked) { baseHue = rgbToHsb(grp.color.r, grp.color.g, grp.color.b).h; break; }
+  if (lockedIdx.length) {
+    const c = groups[lockedIdx[0]].color;
+    baseHue = rgbToHsb(c.r, c.g, c.b).h;
   }
   const hues = buildHues(n, baseHue, mode);
 
-  // Build a balanced tone for each slot: brightness spread evenly across the
-  // style's range (so swatches stay visually separated), with light jitter.
+  // Locked groups claim their nearest hue slot; unlocked groups take the rest.
+  const slotUsed = new Array(n).fill(false);
+  const slotFor = new Array(n).fill(-1);
+  for (const gi of lockedIdx) {
+    const c = groups[gi].color;
+    const gh = rgbToHsb(c.r, c.g, c.b).h;
+    let best = -1, bd = Infinity;
+    for (let s = 0; s < n; s++) {
+      if (slotUsed[s]) continue;
+      const d = circDist(hues[s], gh);
+      if (d < bd) { bd = d; best = s; }
+    }
+    slotUsed[best] = true; slotFor[gi] = best;
+  }
+  let cur = 0;
+  for (let gi = 0; gi < n; gi++) {
+    if (groups[gi].locked) continue;
+    while (slotUsed[cur]) cur++;
+    slotUsed[cur] = true; slotFor[gi] = cur;
+  }
+
+  // Balanced tones: brightness spread evenly across the style's range (so
+  // swatches stay visually separated), with light jitter, then shuffled so no
+  // layer is permanently the brightest.
   const tones = [];
   for (let i = 0; i < n; i++) {
     const t = n > 1 ? i / (n - 1) : 0.5;
@@ -156,30 +200,96 @@ function generateGroupedPalette() {
     if (bri < 0.22) sat = Math.min(sat, 0.85); // keep very dark tones from clipping
     tones.push({ bri: bri, sat: sat });
   }
-  shuffle(tones);                       // break the fixed position->brightness link
+  shuffle(tones);
 
-  // Assign hues to groups, then pull a shuffled tone for each unlocked group.
-  // Locked groups consume a hue slot but keep their own colour and tone.
+  const out = new Array(n);
   let toneCursor = 0;
   for (let gi = 0; gi < n; gi++) {
-    const grp = groups[gi];
-    let color;
-    if (grp.locked) {
-      color = grp.color;
+    if (groups[gi].locked) {
+      out[gi] = groups[gi].color;
       toneCursor++;                     // locked group still claims a tone slot
     } else {
       const tone = tones[toneCursor++];
-      const rgb = hsbToRgb(hues[gi], tone.sat, tone.bri);
-      color = { r: rgb[0], g: rgb[1], b: rgb[2], hex: toHex(rgb[0], rgb[1], rgb[2]) };
+      const rgb = hsbToRgb(hues[slotFor[gi]], tone.sat, tone.bri);
+      out[gi] = { r: rgb[0], g: rgb[1], b: rgb[2], hex: toHex(rgb[0], rgb[1], rgb[2]) };
     }
-    for (const idx of grp.members) {
+  }
+  return out;
+}
+
+// A palette's score is the distance between its two most-similar colours —
+// higher means every pair is comfortably distinguishable.
+function scoreCandidate(colors) {
+  if (colors.length < 2) return Infinity;
+  let min = Infinity;
+  for (let i = 0; i < colors.length; i++) {
+    for (let j = i + 1; j < colors.length; j++) {
+      const d = colorDist(colors[i], colors[j]);
+      if (d < min) min = d;
+    }
+  }
+  return min;
+}
+
+// Generate one colour per distinct group and write it to every member layer.
+// Rolls several candidates and keeps the one whose closest pair is furthest
+// apart, so a reroll never hands back two near-identical swatches.
+function generateGroupedPalette() {
+  const groups = computeGroups();
+  const mode = pickHarmony();
+  const sp = styleParams(state.style);
+
+  const ATTEMPTS = 8, GOOD_ENOUGH = 90; // ~a clearly visible difference
+  let best = null, bestScore = -1;
+  for (let a = 0; a < ATTEMPTS; a++) {
+    const cand = buildCandidate(groups, mode, sp);
+    const sc = scoreCandidate(cand);
+    if (sc > bestScore) { bestScore = sc; best = cand; }
+    if (bestScore >= GOOD_ENOUGH) break;
+  }
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const c = best[gi];
+    for (const idx of groups[gi].members) {
       const s = state.swatches[idx];
-      s.r = color.r; s.g = color.g; s.b = color.b; s.hex = color.hex;
+      s.r = c.r; s.g = c.g; s.b = c.b; s.hex = c.hex;
     }
   }
 }
 
 /* ---------------- Photoshop I/O ---------------- */
+
+// Every layer id in the active document (recursing into groups).
+function collectAllLayerIDs() {
+  const out = new Set();
+  if (!app.documents.length) return out;
+  const walk = (layers) => {
+    for (const l of layers) {
+      out.add(l.id);
+      if (l.layers && l.layers.length) walk(l.layers);
+    }
+  };
+  walk(app.activeDocument.layers);
+  return out;
+}
+
+// Drop stored layers that no longer exist in the active document (deleted, or
+// the user switched documents — layer ids are per-document, so stale ids could
+// otherwise recolor unrelated layers). Swatches stay aligned; locks and link
+// groups on surviving layers are preserved.
+function pruneMissingLayers() {
+  if (!state.layerIDs.length) return;
+  if (!app.documents.length) { state.layerIDs = []; state.swatches = []; state.linkArm = null; return; }
+  const existing = collectAllLayerIDs();
+  if (state.layerIDs.every(id => existing.has(id))) return;
+  const keptIds = [], keptSw = [];
+  for (let i = 0; i < state.layerIDs.length; i++) {
+    if (existing.has(state.layerIDs[i])) { keptIds.push(state.layerIDs[i]); keptSw.push(state.swatches[i]); }
+  }
+  state.layerIDs = keptIds;
+  state.swatches = keptSw;
+  state.linkArm = null;
+}
 
 // Returns the IDs of selected layers whose content is a solid color fill.
 async function getSolidFillLayerIDs() {
@@ -246,7 +356,8 @@ async function syncFromLayers() {
   let changed = false;
   for (let i = 0; i < state.layerIDs.length && i < state.swatches.length; i++) {
     const adj = descs[i] && descs[i].adjustment;
-    if (adj && adj.length && adj[0]._obj === "solidColorLayer" && adj[0].color) {
+    if (adj && adj.length && adj[0]._obj === "solidColorLayer" && adj[0].color
+        && typeof adj[0].color.red === "number") {   // non-RGB docs report other colour models
       const col = adj[0].color;
       const r = Math.round(col.red), g = Math.round(col.grain), b = Math.round(col.blue);
       const s = state.swatches[i];
@@ -290,6 +401,7 @@ async function reroll() {
   if (busy) return;
   busy = true;
   try {
+    pruneMissingLayers();
     const sel = await getSolidFillLayerIDs();
     const have = state.layerIDs.length > 0;
     // A new multi-layer selection redefines the set; otherwise keep the stored set.
@@ -318,6 +430,7 @@ function setStatus(msg) { document.getElementById("status").textContent = msg; }
 // groups. Linked layers move together; locked groups stay put.
 async function swapPositions() {
   if (busy) return;
+  pruneMissingLayers();
   if (!state.swatches.length || !state.layerIDs.length) { setStatus("Generate a palette first."); return; }
   const groups = computeGroups();
   const unlocked = groups.filter(grp => !grp.locked);
@@ -353,7 +466,8 @@ function isLinked(idx) { return groupSize(state.swatches[idx].group) > 1; }
 async function applyAll(msg) {
   busy = true;
   try {
-    if (state.layerIDs.length === state.swatches.length) await applyColors(state.layerIDs, state.swatches);
+    pruneMissingLayers();
+    if (state.layerIDs.length && state.layerIDs.length === state.swatches.length) await applyColors(state.layerIDs, state.swatches);
   } catch (e) {
     setStatus("Error: " + (e && e.message ? e.message : e));
   } finally {
