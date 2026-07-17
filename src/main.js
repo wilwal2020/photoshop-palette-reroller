@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "1.6.5";
+const VERSION = "1.6.6";
 
 const photoshop = require("photoshop");
 const app = photoshop.app;
@@ -427,8 +427,11 @@ async function reroll() {
 /* ---------------- UI ---------------- */
 function setStatus(msg) { document.getElementById("status").textContent = msg; }
 
-// Reassign colours to different layers by rotating them among the unlocked
-// groups. Linked layers move together; locked groups stay put.
+// Reassign the current colours to different layers: a uniformly random
+// permutation of the unlocked groups (identity excluded, so something always
+// moves). Unlike a fixed rotation, every arrangement is reachable — including
+// partial swaps where some colours stay put. Linked layers move together;
+// locked groups never move.
 async function swapPositions() {
   if (busy) return;
   hoverRevealOut();
@@ -441,9 +444,10 @@ async function swapPositions() {
   busy = true;
   try {
     const colors = unlocked.map(grp => ({ r: grp.color.r, g: grp.color.g, b: grp.color.b, hex: grp.color.hex }));
-    const rotated = colors.slice(1).concat(colors[0]); // shift by one
+    const perm = colors.map((_, i) => i);
+    do { shuffle(perm); } while (perm.every((v, i) => v === i)); // never a no-op
     unlocked.forEach((grp, k) => {
-      const c = rotated[k];
+      const c = colors[perm[k]];
       for (const idx of grp.members) {
         const s = state.swatches[idx];
         s.r = c.r; s.g = c.g; s.b = c.b; s.hex = c.hex;
