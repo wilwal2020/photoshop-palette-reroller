@@ -30,10 +30,15 @@ plugins (min host version 23.3.0).
 After editing anything in `src/`, rebuild the installable package:
 
 ```
-python build.py
+python build.py            # bump patch version (1.6.1 -> 1.6.2), then build
+python build.py --no-bump  # rebuild without changing the version
+python build.py --minor    # bump minor (1.6.2 -> 1.7.0)
+python build.py --major    # bump major (1.6.2 -> 2.0.0)
 ```
 
-(or `./build.ps1` on Windows). Then commit and push — opening the updated
-`PaletteReroller.ccx` installs the new version.
+(or `./build.ps1` on Windows). The build bumps the version in `src/manifest.json`
+so Photoshop reliably recognizes the update, keeps this README in sync, and
+regenerates `PaletteReroller.ccx`. Then commit and push — opening the updated
+`.ccx` installs the new version.
 
-Current version: **1.6.1** (also set in `src/manifest.json`)
+Current version: **1.6.2** (set in `src/manifest.json`)
