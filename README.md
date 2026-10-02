@@ -7,6 +7,7 @@ A Photoshop (UXP) plugin panel for generating and rerolling color palettes direc
 - **Harmonies:** Analogous, Complementary, Split, Triadic, Tetradic, Mono — tick any mix; each Generate picks one of them (the status line says which)
 - **Styles:** Default, Vibrant, Muted, Pastel, Deep
 - **Perceptual color engine (OKLCH):** palettes get evenly spaced lightness for every hue, every part of the color wheel equally often, and no muddy olive darks
+- **Place by size (optional):** measures how much of the image each layer really covers (masks, clipping, opacity, and what's stacked on top) and what each one sits on. Big areas get calm colors at the light or dark end, small details get the most vivid ones, and every layer is made to stand out from the layer under it. Uses the Imaging API on Photoshop 24.4+; older versions fall back to layer bounds
 - **Lock and link swatches:** reroll only the colors you haven't settled on; linked layers always share a color, and locked colors steer the harmony around them
 - **Swap** reshuffles the current colors across layers; **hover a chain icon** to flash that layer green in the document
 - Works against a live set of solid-color fill layers, remembered per open document
@@ -43,4 +44,4 @@ so Photoshop reliably recognizes the update, keeps this README in sync, and
 regenerates `PaletteReroller.ccx`. Then commit and push — opening the updated
 `.ccx` installs the new version.
 
-Current version: **1.7.0** (set in `src/manifest.json`)
+Current version: **1.8.0** (set in `src/manifest.json`)

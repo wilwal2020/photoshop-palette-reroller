@@ -73,11 +73,37 @@
   .dd-item.check:hover { background: var(--panel); color: var(--txt); }
   .dd-item.check:hover .box { border-color: var(--txt); }
 
+  /* on/off switch */
+  .toggle {
+    display: flex; align-items: center; gap: 8px; cursor: pointer;
+    margin: -4px 0 12px; padding: 2px 0;
+  }
+  .toggle .switch {
+    display: block; position: relative; flex: 0 0 auto;
+    width: 26px; height: 14px; border-radius: 7px;
+    background: var(--panel); border: 1px solid var(--line);
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .toggle .knob {
+    display: block; position: absolute; top: 1px; left: 1px;
+    width: 10px; height: 10px; border-radius: 5px;
+    background: var(--txt-dim); transition: left 0.12s, background 0.12s;
+  }
+  .toggle.on .switch { background: var(--accent); border-color: var(--accent); }
+  .toggle.on .knob { left: 13px; background: #fff; }
+  .toggle .tlabel { color: var(--txt); flex: 0 0 auto; }
+  .toggle .tsub {
+    color: var(--txt-dim); font-size: 10px; margin-left: auto; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .toggle:hover .switch { border-color: var(--txt-dim); }
+  .toggle.on:hover .switch { border-color: var(--accent-hi); }
+
   .divider { height: 1px; background: var(--line); margin: 4px 0 12px; }
 
   /* swatches */
-  .sw-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-  .sw-head .hint { color: var(--txt-dim); font-size: 10px; }
+  .sw-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .sw-head .hint { color: var(--txt-dim); font-size: 10px; text-align: right; }
   #swatches { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; }
   .sw {
     display: flex; align-items: center; gap: 10px;
@@ -168,11 +194,18 @@
     </div>
   </div>
 
+  <div class="toggle" id="sizeToggle"
+       title="Big layers get calm colours and small details the most vivid ones, and every layer stands out from the layer it sits on.">
+    <span class="switch"><span class="knob"></span></span>
+    <span class="tlabel">Place by size</span>
+    <span class="tsub">big = calm &middot; small = vivid</span>
+  </div>
+
   <div class="divider"></div>
 
   <div class="sw-head">
     <span class="label" style="margin:0">Swatches</span>
-    <span class="hint">row = lock &middot; chain = link &middot; hover = reveal</span>
+    <span class="hint">row&nbsp;=&nbsp;lock &middot; chain&nbsp;=&nbsp;link &middot; hover&nbsp;=&nbsp;reveal</span>
   </div>
   <div id="swatches">
     <div class="placeholder">Select your Solid Color fill layers, then hit Generate.</div>

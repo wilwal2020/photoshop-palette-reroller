@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 
 const photoshop = require("photoshop");
 const app = photoshop.app;
@@ -31,6 +31,7 @@ function styleParams(style) {
 const state = {
   enabledHarmonies: ["Analogous", "Complementary", "Split", "Triadic", "Tetradic", "Mono"],
   style: "Default",
+  placeBySize: false,  // pick which colour goes where from each layer's visible size
   docID: null,      // the document the working set below belongs to
   swatches: [],     // [{ r, g, b, hex, locked, group }] aligned 1:1 with layerIDs
   layerIDs: [],     // the working set of fill-layer IDs the panel controls
@@ -148,9 +149,11 @@ function makeColor(r, g, b) {
 }
 
 /* ---------------- palette generation ---------------- */
-const NEUTRAL_C = 0.025;   // below this chroma a colour is effectively grey; its hue means nothing
-const ATTEMPTS = 12;       // candidate palettes rolled per Generate
-const SEP_TARGET = 0.09;   // OKLab distance at which two swatches read as clearly different
+const NEUTRAL_C = 0.025;      // below this chroma a colour is effectively grey; its hue means nothing
+const ATTEMPTS = 12;          // candidate palettes rolled per Generate
+const ATTEMPTS_SIZED = 24;    // more when placing by size, which has more to satisfy
+const SEP_TARGET = 0.09;      // OKLab distance at which two swatches read as clearly different
+const CONTRAST_TARGET = 0.26; // how far a layer should stand off from the layer it sits on (see standOff)
 
 function pickHarmony() {
   const pool = state.enabledHarmonies.length ? state.enabledHarmonies : HARMONIES.slice(1);
@@ -222,7 +225,9 @@ function drabness(h, L) {
 
 // Everything about a roll that stays fixed across its candidates: the
 // harmony's shape and rotation, the lightness band, and the locked colours.
-function planPalette(groups, mode, sp) {
+// `stacked` (placing by size, with layers sitting on each other) asks for
+// enough lightness range that stacked layers can stand apart.
+function planPalette(groups, mode, sp, stacked) {
   const n = groups.length;
   const plan = {
     mode: mode, fams: null, base: 0, span: 0, nHue: n,
@@ -270,7 +275,7 @@ function planPalette(groups, mode, sp) {
   // Harmonies with little hue contrast need more lightness contrast to keep
   // their swatches apart, so widen the band for them when it's too narrow.
   const perStep = mode === "Mono" ? 0.075 : (mode === "Analogous" ? 0.05 : 0.035);
-  const need = Math.min(perStep * (n - 1), 0.62);
+  const need = Math.min(Math.max(perStep * (n - 1), stacked ? 0.24 : 0), 0.62);
   const width = plan.lMax - plan.lMin;
   if (width < need) {
     const grow = need - width, mid = (plan.lMin + plan.lMax) / 2;
@@ -353,22 +358,184 @@ function claimNearest(slots, values, dist) {
   return free;
 }
 
+// Roll up per-layer size measurements into link groups. Each group gets its
+// total visual weight, the group it mostly sits on (`backdrop`, -1 for none),
+// and `rel`: its size on a log scale from 0 (smallest) to 1 (largest), or
+// null when the sizes are too alike (under 2x apart) to say anything.
+function groupSizes(groups, layerSizes) {
+  const gOf = [];
+  groups.forEach((g, gi) => g.members.forEach(m => { gOf[m] = gi; }));
+  const info = groups.map(() => ({ weight: 0, under: new Map(), backdrop: -1, rel: null }));
+  layerSizes.forEach((s, li) => {
+    const gi = gOf[li];
+    if (!s || gi === undefined) return;
+    info[gi].weight += s.weight;
+    for (const [lj, amount] of s.under) {
+      const gj = lj < 0 ? -1 : gOf[lj];
+      if (gj === undefined || gj === gi) continue;   // sitting on its own linked layers doesn't count
+      info[gi].under.set(gj, (info[gi].under.get(gj) || 0) + amount);
+    }
+  });
+  for (const x of info) {
+    let best = 0;
+    for (const [gj, amount] of x.under) if (amount > best) { best = amount; x.backdrop = gj; }
+  }
+  const logs = info.filter(x => x.weight > 1e-5).map(x => Math.log(x.weight));
+  const lo = Math.min(...logs), hi = Math.max(...logs);
+  if (logs.length >= 2 && hi - lo >= Math.log(2)) {
+    for (const x of info) if (x.weight > 1e-5) x.rel = (Math.log(x.weight) - lo) / (hi - lo);
+  }
+  return info;
+}
+
+// Contrast a group should have against what it sits on. Small areas need
+// more to read (colour differences are harder to see on small patches), so
+// the target grows to 1.6x for the smallest details.
+function contrastTarget(g) {
+  return CONTRAST_TARGET * (1 + 0.6 * (1 - (g.rel === null ? 0.5 : g.rel)));
+}
+
+// How many layers deep a group sits (0: on nothing of ours).
+function stackDepth(size, gi) {
+  let d = 0;
+  for (let g = size[gi].backdrop; g >= 0 && d < size.length; g = size[g].backdrop) d++;
+  return d;
+}
+
+// Lightness-only estimate of contrastShortfall, for placing lightness before
+// hues and chroma are chosen.
+function lightnessShortfall(L, size) {
+  let sum = 0;
+  size.forEach((g, gi) => {
+    if (g.backdrop < 0 || L[gi] === undefined || L[g.backdrop] === undefined) return;
+    const w = Math.min(1, g.weight / 0.002);
+    sum += w * Math.max(0, 1 - 1.6 * Math.abs(L[gi] - L[g.backdrop]) / contrastTarget(g));
+  });
+  return sum;
+}
+
+// Hand the free lightness slots to the unlocked groups. Without size info
+// that's a plain shuffle. Placing by size, the biggest group takes the
+// lightest or darkest slot as a calm ground; then each group, after whatever
+// it sits on (and small details before bigger shapes beside them), takes the
+// slot that stands out most against its backdrop — sometimes the runner-up,
+// for variety. A few swap passes then fix anything the greedy order missed,
+// and small details that still can't stand out inside the style's lightness
+// band may step up to ACCENT_REACH outside it, the way a tiny bright accent
+// works in a dark design (the big areas keep the style's look).
+const ACCENT_REACH = 0.15;
+function assignLightness(free, slots, L, size, band) {
+  slots = slots.slice();
+  if (!size) {
+    shuffle(slots);
+    free.forEach((gi, k) => { L[gi] = slots[k]; });
+    return;
+  }
+  const dominant = free.filter(gi => size[gi].rel === 1);
+  const rest = free.filter(gi => size[gi].rel !== 1);
+  const depth = new Map(rest.map(gi => [gi, stackDepth(size, gi)]));
+  const noisy = new Map(rest.map(gi => [gi, size[gi].weight * rand(0.8, 1.25)]));
+  rest.sort((a, b) => depth.get(a) - depth.get(b) || noisy.get(a) - noisy.get(b));
+  for (const gi of dominant.concat(rest)) {
+    const g = size[gi];
+    let pick;
+    if (g.rel === 1) {
+      const darkest = Math.random() < 0.5;
+      pick = 0;
+      for (let i = 1; i < slots.length; i++) if (darkest ? slots[i] < slots[pick] : slots[i] > slots[pick]) pick = i;
+    } else if (g.backdrop >= 0 && L[g.backdrop] !== undefined) {
+      const ref = L[g.backdrop];
+      const ranked = slots.map((v, i) => i).sort((a, b) => Math.abs(slots[b] - ref) - Math.abs(slots[a] - ref));
+      pick = ranked[ranked.length > 1 && Math.random() < 0.3 ? 1 : 0];
+    } else {
+      pick = Math.floor(Math.random() * slots.length);
+    }
+    L[gi] = slots[pick];
+    slots.splice(pick, 1);
+  }
+  let cost = lightnessShortfall(L, size);
+  for (let pass = 0; pass < 4 && cost > 0; pass++) {
+    let improved = false;
+    for (let i = 0; i < rest.length; i++) {
+      for (let j = i + 1; j < rest.length; j++) {
+        const a = rest[i], b = rest[j];
+        [L[a], L[b]] = [L[b], L[a]];
+        const c = lightnessShortfall(L, size);
+        if (c < cost - 1e-9) { cost = c; improved = true; }
+        else [L[a], L[b]] = [L[b], L[a]];
+      }
+    }
+    if (!improved) break;
+  }
+  if (!band) return;
+  const lo = Math.max(0.12, band.lMin - ACCENT_REACH), hi = Math.min(0.96, band.lMax + ACCENT_REACH);
+  for (const gi of rest) {
+    const g = size[gi];
+    if (g.rel === null || g.rel > 0.35 || g.backdrop < 0 || L[g.backdrop] === undefined) continue;
+    const ref = L[g.backdrop], need = contrastTarget(g) / 1.6;
+    if (Math.abs(L[gi] - ref) >= need) continue;
+    // step out on whichever side gets more contrast, preferring its own side
+    const up = Math.min(hi, ref + need), down = Math.max(lo, ref - need);
+    const own = L[gi] >= ref ? up : down, other = L[gi] >= ref ? down : up;
+    const best = Math.abs(own - ref) >= Math.abs(other - ref) - 0.02 ? own : other;
+    if (Math.abs(best - ref) > Math.abs(L[gi] - ref)) L[gi] = best;
+  }
+}
+
+// Share of the gamut's chroma a colour uses. Placing by size, big areas lean
+// calm and small ones vivid (rel: 0 = smallest group, 1 = largest).
+function chromaShare(sp, rel) {
+  if (rel === null || rel === undefined) return rand(sp.rcMin, sp.rcMax);
+  const u = rand(0.45 * (1 - rel), 1 - 0.45 * rel);
+  return (sp.rcMin + (sp.rcMax - sp.rcMin) * u) * (1 - 0.45 * Math.pow(rel, 1.5));
+}
+
+// How clearly one colour stands off another it sits on. Weighted toward
+// lightness, since lightness contrast is what makes shapes read.
+function standOff(p, q) {
+  const dL = (p.L - q.L) * 1.6, da = p.a - q.a, db = p.b - q.b;
+  return Math.sqrt(dL * dL + da * da + db * db);
+}
+
+// Average shortfall (0 = every layer stands off what it sits on) across
+// layers with a backdrop; nearly invisible layers count for less.
+function contrastShortfall(colors, groups, size) {
+  let sum = 0, wsum = 0;
+  size.forEach((g, gi) => {
+    const b = g.backdrop;
+    if (b < 0 || (groups[gi].locked && groups[b].locked)) return;
+    const w = Math.min(1, g.weight / 0.002);
+    if (w <= 0) return;
+    sum += w * Math.max(0, 1 - standOff(colors[gi].lab, colors[b].lab) / contrastTarget(g));
+    wsum += w;
+  });
+  return wsum ? sum / wsum : 0;
+}
+
 // One candidate palette: locked colours claim the hue and lightness slots
-// nearest their own, and the leftover slots are shuffled onto the unlocked
-// colours independently, so any layer can get any hue at any lightness.
-function buildCandidate(groups, plan, sp) {
+// nearest their own, and the leftover slots go to the unlocked colours —
+// hues at random, lightness at random or (placing by size) by role.
+function buildCandidate(groups, plan, sp, size) {
+  const n = groups.length;
   const hues = shuffle(claimNearest(buildHueSlots(plan), plan.lockedHues, circDist));
-  const lights = shuffle(claimNearest(buildLightnessSlots(plan.lSlots, plan.lMin, plan.lMax),
-                                      plan.lockedL, (a, b) => Math.abs(a - b)));
-  const colors = new Array(groups.length);
+  const lights = claimNearest(buildLightnessSlots(plan.lSlots, plan.lMin, plan.lMax),
+                              plan.lockedL, (a, b) => Math.abs(a - b));
+  const L = new Array(n), free = [];
+  for (let gi = 0; gi < n; gi++) {
+    if (groups[gi].locked) L[gi] = plan.lockedColor[gi].lab.L;
+    else free.push(gi);
+  }
+  assignLightness(free, lights, L, size, plan);
+
+  const colors = new Array(n);
   let drab = 0;
-  for (let gi = 0; gi < groups.length; gi++) {
+  for (let gi = 0; gi < n; gi++) {
     if (groups[gi].locked) { colors[gi] = plan.lockedColor[gi]; continue; }
-    const L = lights.pop(), slotHue = hues.pop();
-    drab += drabness(slotHue, L);
-    const h = norm360(shiftHue(slotHue, L));
-    const C = Math.min(rand(sp.rcMin, sp.rcMax) * maxChroma(L, h), sp.cMax);
-    const rgb = oklchToRgb(L, C, h);
+    const slotHue = hues.pop();
+    drab += drabness(slotHue, L[gi]);
+    const h = norm360(shiftHue(slotHue, L[gi]));
+    const C = Math.min(chromaShare(sp, size ? size[gi].rel : null) * maxChroma(L[gi], h), sp.cMax);
+    const rgb = oklchToRgb(L[gi], C, h);
     colors[gi] = makeColor(rgb[0], rgb[1], rgb[2]);
   }
   return { colors: colors, drab: drab };
@@ -407,22 +574,26 @@ function computeGroups() {
 }
 
 // Generate one colour per unlocked group and write it to every member layer.
-// Rolls up to ATTEMPTS candidates and keeps the best: swatches clearly apart,
-// and no yellows forced dark. Returns the harmony used, or null when
-// everything is locked.
-function generateGroupedPalette() {
+// Rolls several candidates and keeps the best: swatches clearly apart, no
+// yellows forced dark, and — given `layerSizes` (from measureLayerSizes,
+// aligned with state.layerIDs) — every layer standing off what it sits on.
+// Returns the harmony used, or null when everything is locked.
+function generateGroupedPalette(layerSizes) {
   const groups = computeGroups();
   if (groups.every(g => g.locked)) return null;
   const mode = pickHarmony();
   const sp = styleParams(state.style);
-  const plan = planPalette(groups, mode, sp);
+  const size = layerSizes ? groupSizes(groups, layerSizes) : null;
+  const plan = planPalette(groups, mode, sp, !!size && size.some(g => g.backdrop >= 0));
 
   let best = null, bestScore = -Infinity;
-  for (let a = 0; a < ATTEMPTS; a++) {
-    const cand = buildCandidate(groups, plan, sp);
-    const score = Math.min(minSeparation(cand.colors, groups) / SEP_TARGET, 1) - sp.drab * cand.drab;
+  const attempts = size ? ATTEMPTS_SIZED : ATTEMPTS;
+  for (let a = 0; a < attempts; a++) {
+    const cand = buildCandidate(groups, plan, sp, size);
+    let score = Math.min(minSeparation(cand.colors, groups) / SEP_TARGET, 1) - sp.drab * cand.drab;
+    if (size) score -= contrastShortfall(cand.colors, groups, size);
     if (score > bestScore) { bestScore = score; best = cand; }
-    if (score >= 1) break;   // well separated and nothing drab: good enough
+    if (score >= 1) break;   // nothing left to improve: good enough
   }
 
   for (let gi = 0; gi < groups.length; gi++) {
@@ -522,6 +693,237 @@ async function getSolidFillLayerIDs() {
     if (isSolidFill(descs[i])) ids.push(layers[i].id);
   }
   return ids;
+}
+
+/* ---------------- layer sizes (Place by size) ---------------- */
+// Measures how much of the image each layer in the working set really covers
+// and what each one sits on, on a coarse grid over the document. A layer's
+// shape is its content bounds, refined by its vector and user masks (read
+// with the Imaging API, Photoshop 24.4+; bounds alone on older versions),
+// limited to its clipping base, faded by its opacity, and hidden where layers
+// above cover it.
+const SIZE_GRID = 128;   // cells along the document's long side
+
+function num(v) { return typeof v === "number" ? v : (v && typeof v._value === "number" ? v._value : NaN); }
+
+// Every layer by id, with its stacking position (0 = topmost) and siblings.
+function layerTree(doc) {
+  const out = new Map();
+  let z = 0;
+  const walk = (coll) => {
+    const sibs = [];
+    for (let i = 0; i < coll.length; i++) sibs.push(coll[i]);
+    sibs.forEach((l, i) => {
+      out.set(l.id, { dom: l, z: z++, sibs: sibs, index: i });
+      if (l.layers && l.layers.length) walk(l.layers);
+    });
+  };
+  walk(doc.layers);
+  return out;
+}
+
+function boundsIn(dom, grid) {
+  const b = dom && (dom.boundsNoEffects || dom.bounds);
+  if (!b) return null;
+  const left = Math.max(0, Math.floor(num(b.left))), top = Math.max(0, Math.floor(num(b.top)));
+  const right = Math.min(grid.docW, Math.ceil(num(b.right))), bottom = Math.min(grid.docH, Math.ceil(num(b.bottom)));
+  return right > left && bottom > top ? { left, top, right, bottom } : null;
+}
+
+// Opacity that reaches the image: own opacity and fill, times every enclosing
+// group's opacity; 0 if it or any enclosing group is hidden.
+function effectiveAlpha(dom) {
+  let a = 1;
+  for (let l = dom, depth = 0; l && depth < 64; l = l.parent, depth++) {
+    if (l.visible === false) return 0;
+    const o = num(l.opacity);
+    if (o >= 0) a *= o / 100;
+  }
+  const f = num(dom.fillOpacity);
+  return f >= 0 ? a * f / 100 : a;
+}
+
+// The layer a clipped layer is clipped to: the nearest unclipped one below it.
+function clippingBase(node) {
+  if (!node.dom.isClippingMask) return null;
+  for (let k = node.index + 1; k < node.sibs.length; k++) {
+    if (!node.sibs[k].isClippingMask) return node.sibs[k];
+  }
+  return null;
+}
+
+// Fraction of each grid cell inside rectangle b.
+function rectCoverage(grid, b) {
+  const cov = new Float32Array(grid.W * grid.H);
+  if (!b) return cov;
+  const x0 = Math.floor(b.left / grid.cw), x1 = Math.min(grid.W - 1, Math.ceil(b.right / grid.cw) - 1);
+  const y0 = Math.floor(b.top / grid.ch), y1 = Math.min(grid.H - 1, Math.ceil(b.bottom / grid.ch) - 1);
+  for (let y = y0; y <= y1; y++) {
+    const oy = Math.min(b.bottom, (y + 1) * grid.ch) - Math.max(b.top, y * grid.ch);
+    for (let x = x0; x <= x1; x++) {
+      const ox = Math.min(b.right, (x + 1) * grid.cw) - Math.max(b.left, x * grid.cw);
+      if (ox > 0 && oy > 0) cov[y * grid.W + x] = (ox * oy) / (grid.cw * grid.ch);
+    }
+  }
+  return cov;
+}
+
+// Multiply coverage by an image (mask or alpha values) that spans document
+// rect `src`. Each cell takes the average of the image over its part of the
+// layer bounds `b`. Photoshop may trim the image, so parts of `b` outside
+// `src` take `img.outside`: shown (1) for masks, empty (0) for transparency.
+function multiplyByImage(cov, grid, b, src, img) {
+  const sw = src.right - src.left, sh = src.bottom - src.top;
+  if (!(sw > 0 && sh > 0)) return;
+  const sx = img.w / sw, sy = img.h / sh;
+  for (let y = 0; y < grid.H; y++) {
+    const cy0 = Math.max(b.top, y * grid.ch), cy1 = Math.min(b.bottom, (y + 1) * grid.ch);
+    if (cy1 <= cy0) continue;
+    for (let x = 0; x < grid.W; x++) {
+      const i = y * grid.W + x;
+      if (!cov[i]) continue;
+      const cx0 = Math.max(b.left, x * grid.cw), cx1 = Math.min(b.right, (x + 1) * grid.cw);
+      if (cx1 <= cx0) continue;
+      const ix0 = Math.max(cx0, src.left), ix1 = Math.min(cx1, src.right);
+      const iy0 = Math.max(cy0, src.top), iy1 = Math.min(cy1, src.bottom);
+      if (ix1 <= ix0 || iy1 <= iy0) continue;
+      const px0 = Math.min(img.w - 1, Math.floor((ix0 - src.left) * sx));
+      const px1 = Math.max(px0, Math.min(img.w - 1, Math.ceil((ix1 - src.left) * sx) - 1));
+      const py0 = Math.min(img.h - 1, Math.floor((iy0 - src.top) * sy));
+      const py1 = Math.max(py0, Math.min(img.h - 1, Math.ceil((iy1 - src.top) * sy) - 1));
+      let sum = 0, cnt = 0;
+      for (let py = py0; py <= py1; py++) {
+        for (let px = px0; px <= px1; px++) { sum += img.data[(py * img.w + px) * img.stride + img.offset]; cnt++; }
+      }
+      const inside = ((ix1 - ix0) * (iy1 - iy0)) / ((cx1 - cx0) * (cy1 - cy0));
+      cov[i] *= (sum / cnt / img.scale) * inside + img.outside * (1 - inside);
+    }
+  }
+}
+
+// Read a mask ("user" / "vector") or, with kind "alpha", the layer's pixel
+// transparency, for rectangle b at about two samples per grid cell.
+async function readLayerImage(docID, layerID, kind, b, grid) {
+  const imaging = photoshop.imaging;
+  const opts = { documentID: docID, layerID: layerID, sourceBounds: b };
+  const want = Math.max(1, Math.ceil((b.right - b.left) / grid.cw * 2));
+  if (want < b.right - b.left) opts.targetSize = { width: want };
+  let res;
+  if (kind === "alpha") res = await imaging.getPixels(Object.assign(opts, { componentSize: 8 }));
+  else res = await imaging.getLayerMask(Object.assign(opts, { kind: kind }));
+  const d = res.imageData;
+  try {
+    if (kind === "alpha" && !d.hasAlpha) return null;   // opaque throughout its bounds
+    const cs = d.componentSize;
+    return {
+      data: await d.getData({ chunky: true }), w: d.width, h: d.height,
+      stride: d.components || 1, offset: kind === "alpha" ? (d.components || 1) - 1 : 0,
+      scale: cs === 16 ? 32768 : (cs === 32 ? 1 : 255),
+      outside: kind === "alpha" ? 0 : 1,
+      src: res.sourceBounds || b
+    };
+  } finally {
+    d.dispose();
+  }
+}
+
+// Where a layer can show at all: its bounds, refined by its masks and (for
+// layers with pixels of their own) its transparency. A failed read just
+// leaves the coarser estimate; `stats` counts reads for the status line.
+async function shapeCoverage(docID, id, dom, desc, grid, stats) {
+  const b = boundsIn(dom, grid);
+  const cov = rectCoverage(grid, b);
+  if (!b || stats.rough) return cov;
+  const reads = [];
+  if (desc.hasVectorMask && desc.vectorMaskEnabled !== false) reads.push("vector");
+  if (desc.hasUserMask && desc.userMaskEnabled !== false) reads.push("user");
+  if (!(desc.adjustment && desc.adjustment.length)) reads.push("alpha");   // not a fill layer
+  for (const kind of reads) {
+    try {
+      const img = await readLayerImage(docID, id, kind, b, grid);
+      if (img) multiplyByImage(cov, grid, b, img.src, img);
+      stats.ok++;
+    } catch (e) {
+      stats.failed++;
+    }
+  }
+  return cov;
+}
+
+// For each layer in the working set: `weight`, the fraction of the image it
+// visibly covers, and `under`, [[layer index or -1 for none, amount], ...]
+// saying what it sits on. Returns { rough, layers } or null.
+async function measureLayerSizes() {
+  const doc = app.activeDocument;
+  const docW = num(doc.width), docH = num(doc.height);
+  if (!(docW > 0 && docH > 0)) return null;
+  const k = SIZE_GRID / Math.max(docW, docH);
+  const grid = { W: Math.max(1, Math.round(docW * k)), H: Math.max(1, Math.round(docH * k)), docW, docH };
+  grid.cw = docW / grid.W;
+  grid.ch = docH / grid.H;
+  const imaging = photoshop.imaging;
+  const stats = { ok: 0, failed: 0,
+    rough: !(imaging && typeof imaging.getLayerMask === "function" && typeof imaging.getPixels === "function") };
+
+  const tree = layerTree(doc);
+  const ids = state.layerIDs;
+  if (ids.some(id => !tree.has(id))) return null;
+  const getDesc = idList => batchPlay(idList.map(id => ({ _obj: "get", _target: [{ _ref: "layer", _id: id }] })), {});
+  const descs = await getDesc(ids);
+
+  const entries = [];
+  for (let i = 0; i < ids.length; i++) {
+    const node = tree.get(ids[i]);
+    const alpha = effectiveAlpha(node.dom);
+    const cov = alpha > 0
+      ? await shapeCoverage(doc.id, ids[i], node.dom, descs[i] || {}, grid, stats)
+      : new Float32Array(grid.W * grid.H);
+    entries.push({ i, id: ids[i], node, alpha, cov });
+  }
+
+  // clipped layers only show where their base does
+  const baseCov = new Map(entries.map(e => [e.id, e.cov]));
+  for (const e of entries) {
+    if (!e.alpha) continue;
+    const base = clippingBase(e.node);
+    if (!base) continue;
+    let bc = baseCov.get(base.id);
+    if (!bc) {
+      const bd = (await getDesc([base.id]))[0] || {};
+      bc = await shapeCoverage(doc.id, base.id, base, bd, grid, stats);
+      baseCov.set(base.id, bc);
+    }
+    for (let p = 0; p < bc.length; p++) e.cov[p] *= Math.min(1, bc[p]);
+  }
+
+  // top-down: what each layer still shows after the layers above it
+  const P = grid.W * grid.H;
+  const order = entries.slice().sort((a, b) => a.node.z - b.node.z);
+  const remaining = new Float32Array(P).fill(1);
+  for (const e of order) {
+    let w = 0;
+    for (let p = 0; p < P; p++) {
+      const v = e.cov[p] * e.alpha * remaining[p];
+      if (v > 0) { w += v; remaining[p] -= v; }
+    }
+    e.weight = w / P;
+  }
+  // bottom-up: which layer each one sits on, tracking each cell's top opaque layer
+  const owner = new Int32Array(P).fill(-1);
+  for (let j = order.length - 1; j >= 0; j--) {
+    const e = order[j], under = new Map();
+    for (let p = 0; p < P; p++) {
+      const c = e.cov[p] * e.alpha;
+      if (c <= 0) continue;
+      under.set(owner[p], (under.get(owner[p]) || 0) + c);
+      if (c >= 0.5) owner[p] = e.i;
+    }
+    e.under = Array.from(under.entries());
+  }
+  return {
+    rough: stats.rough || (stats.failed > 0 && stats.ok === 0),
+    layers: entries.map(e => ({ weight: e.weight, under: e.under }))
+  };
 }
 
 /* ---------------- main action ---------------- */
@@ -658,13 +1060,22 @@ async function reroll() {
       if (!sel.length) { renderSwatches(); setStatus("Select one or more Solid Color fill layers."); return; }
       captureSet(sel);
     }
-    const mode = generateGroupedPalette();
+    let sizes = null, sizeNote = "";
+    if (state.placeBySize && computeGroups().some(g => !g.locked)) {
+      let m = null;
+      try {
+        await executeAsModal(async () => { m = await measureLayerSizes(); }, { commandName: "Measure Layers" });
+      } catch (e) { m = null; }
+      if (m) { sizes = m.layers; sizeNote = " · by size" + (m.rough ? " (bounds only)" : ""); }
+      else sizeNote = " · couldn't measure sizes";
+    }
+    const mode = generateGroupedPalette(sizes);
     if (!mode) { renderSwatches(); setStatus("Everything is locked — unlock a colour to re-roll."); return; }
     colorEpoch++;
     await applyColors(state.layerIDs, state.swatches, "Re-roll Palette");
     renderSwatches();
     const n = state.layerIDs.length;
-    setStatus(n + " layer" + (n > 1 ? "s" : "") + " recolored · " + mode
+    setStatus(n + " layer" + (n > 1 ? "s" : "") + " recolored · " + mode + sizeNote
       + (dropped ? " (dropped " + dropped + " deleted/converted layer" + (dropped > 1 ? "s" : "") + ")" : ""));
   } catch (e) {
     setStatus("Error: " + (e && e.message ? e.message : e));
@@ -1079,6 +1490,12 @@ function init() {
   const HARMONY_OPTS = HARMONIES.slice(1); // drop the old "Random" entry
   buildChecklist("harmonyDD", HARMONY_OPTS, state.enabledHarmonies);
   buildDropdown("styleDD", STYLES, () => state.style, v => { state.style = v; });
+
+  const sizeToggle = document.getElementById("sizeToggle");
+  sizeToggle.addEventListener("click", () => {
+    state.placeBySize = !state.placeBySize;
+    sizeToggle.classList.toggle("on", state.placeBySize);
+  });
 
   const genBtn = document.getElementById("generate");
   const swapBtn = document.getElementById("swap");
